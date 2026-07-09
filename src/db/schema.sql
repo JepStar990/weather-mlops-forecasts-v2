@@ -1,0 +1,85 @@
+-- Forecasts from each vendor
+CREATE TABLE IF NOT EXISTS forecasts (
+  id BIGSERIAL PRIMARY KEY,
+  source TEXT NOT NULL,              -- 'open_meteo','met_no','openweather','visual_crossing','weather_gov','our_model'
+  lat DOUBLE PRECISION NOT NULL,
+  lon DOUBLE PRECISION NOT NULL,
+  variable TEXT NOT NULL,            -- 'temp_2m','wind_speed_10m','precipitation'
+  issue_time TIMESTAMPTZ NOT NULL,   -- when forecast was issued
+  valid_time TIMESTAMPTZ NOT NULL,   -- target time
+  horizon_hours INT NOT NULL,
+  value DOUBLE PRECISION NOT NULL,
+  unit TEXT NOT NULL,                -- 'C','m/s','mm'
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Observed ground truth
+CREATE TABLE IF NOT EXISTS observations (
+  id BIGSERIAL PRIMARY KEY,
+  station_id TEXT,
+  lat DOUBLE PRECISION NOT NULL,
+  lon DOUBLE PRECISION NOT NULL,
+  variable TEXT NOT NULL,
+  obs_time TIMESTAMPTZ NOT NULL,
+  value DOUBLE PRECISION NOT NULL,
+  unit TEXT NOT NULL,
+  source TEXT NOT NULL,              -- 'meteostat','weather_gov', etc.
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Error metrics per source/horizon/variable/time
+CREATE TABLE IF NOT EXISTS errors (
+  id BIGSERIAL PRIMARY KEY,
+  source TEXT NOT NULL,
+  variable TEXT NOT NULL,
+  valid_time TIMESTAMPTZ NOT NULL,
+  horizon_hours INT NOT NULL,
+  mae DOUBLE PRECISION,
+  rmse DOUBLE PRECISION,
+  mape DOUBLE PRECISION,
+  n INT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Pruning indexes
+CREATE INDEX IF NOT EXISTS idx_forecasts_valid_time ON forecasts(valid_time);
+CREATE INDEX IF NOT EXISTS idx_observations_obs_time ON observations(obs_time);
+CREATE INDEX IF NOT EXISTS idx_errors_valid_time ON errors(valid_time);
+
+-- Compound indexes for common query patterns (reduce seq scans)
+CREATE INDEX IF NOT EXISTS idx_forecasts_var_src_time ON forecasts(variable, source, valid_time);
+CREATE INDEX IF NOT EXISTS idx_forecasts_var_valid ON forecasts(variable, valid_time);
+CREATE INDEX IF NOT EXISTS idx_observations_var_obs ON observations(variable, obs_time);
+CREATE INDEX IF NOT EXISTS idx_errors_var_horiz_time ON errors(variable, horizon_hours, valid_time);
+
+-- Remove any pre-existing duplicate observation rows before creating unique index
+DELETE FROM observations
+WHERE ctid IN (
+  SELECT ctid FROM (
+    SELECT ctid, ROW_NUMBER() OVER (
+      PARTITION BY lat, lon, variable, obs_time, source ORDER BY created_at DESC
+    ) AS rn
+    FROM observations
+  ) ranked
+  WHERE ranked.rn > 1
+);
+
+-- Prevent duplicate observation rows (hourly re-ingestion)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_observations_unique ON observations(lat, lon, variable, obs_time, source);
+
+-- Lightweight model registry pointer (canonical is DagsHub/MLflow)
+CREATE TABLE IF NOT EXISTS models (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  mlflow_run_id TEXT,
+  metrics_json JSONB,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  is_champion BOOLEAN DEFAULT FALSE
+);
+
+-- Migration: add metrics_json column to existing models tables that were
+-- created before this column was introduced.
+ALTER TABLE models ADD COLUMN IF NOT EXISTS metrics_json JSONB;
+
+-- Migration: backfill NULL metrics_json for any rows created before the column existed.
+UPDATE models SET metrics_json = '{}'::jsonb WHERE metrics_json IS NULL;

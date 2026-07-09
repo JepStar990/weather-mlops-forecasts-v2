@@ -1,0 +1,188 @@
+"""
+Train per-variable, per-horizon models.
+- Baseline: linear regression on vendor features (+lags)
+- Ensemble: LightGBM if available; fallback to LinearRegression
+- Log to DagsHub (MLflow)
+"""
+import json
+import os
+import mlflow
+import tempfile
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from mlflow import sklearn as ml_sklearn
+from sklearn.linear_model import LinearRegression
+from lightgbm import LGBMRegressor
+import pandas as pd
+from sqlalchemy import text
+from src.utils.db_utils import db_conn
+from src.config import CFG
+from src.model.features import build_features
+from src.model.evaluate import weekly_folds, evaluate_model
+from src.utils.logging_utils import get_logger
+from mlflow.tracking import MlflowClient
+from sklearn import set_config
+set_config(transform_output="pandas")
+
+logger = get_logger(__name__)
+
+def _setup_mlflow():
+    if not (CFG.DAGSHUB_USERNAME and CFG.DAGSHUB_TOKEN and CFG.PUBLIC_REPO_NAME):
+        logger.warning("DagsHub credentials missing; MLflow will use local filesystem.")
+        return
+    import dagshub
+    dagshub.auth.add_app_token(CFG.DAGSHUB_TOKEN)
+    dagshub.init(repo_owner=CFG.DAGSHUB_USERNAME, repo_name=CFG.PUBLIC_REPO_NAME, mlflow=True)
+    mlflow.set_tracking_uri(f"https://dagshub.com/{CFG.DAGSHUB_USERNAME}/{CFG.PUBLIC_REPO_NAME}.mlflow")
+    mlflow.set_experiment("weather-ensemble")
+
+def train_one(variable: str, horizon: int):
+    Xy = build_features(variable, horizon)
+    if Xy is None or Xy.empty:
+        logger.warning("No data for %s H+%d", variable, horizon)
+        return None
+        
+    # --- feature column selection ---
+    vendor_cols = [c for c in ("open_meteo","met_no","openweather","visual_crossing","weather_gov") if c in Xy.columns]
+    lag_cols = [c for c in Xy.columns if c.startswith("obs_lag_")]
+    feat = vendor_cols + lag_cols + ["hour","dow"]
+
+    import re
+
+    def _sort_lag_cols(cols):
+        def lag_key(c):
+            m = re.search(r"^obs_lag_(\d+)h?$", c)
+            return int(m.group(1)) if m else 10**9
+        return sorted(cols, key=lag_key)
+
+    lag_cols = _sort_lag_cols([c for c in Xy.columns if c.startswith("obs_lag_")])
+    feat = vendor_cols + lag_cols + ["hour", "dow"]
+
+    # --- keep rows: must have target and at least ONE vendor signal ---
+    Xy = Xy[Xy["y"].notna()]
+    if not vendor_cols:
+        logger.warning("No vendor columns present for %s H+%d", variable, horizon)
+        return None
+
+    Xy = Xy.dropna(subset=vendor_cols, how="all")  # >= 1 vendor value
+    if Xy.empty:
+        logger.warning("After vendor filter, no rows for %s H+%d", variable, horizon)
+        return None
+
+    # Fill lag features if missing; rebuild calendar features if needed
+    for c in lag_cols:
+        if c in Xy.columns:
+             Xy[c] = Xy[c].fillna(Xy[c].median())
+
+    if "hour" not in Xy.columns or Xy["hour"].isna().any():
+        Xy["hour"] = pd.to_datetime(Xy["valid_time"]).dt.hour
+    if "dow" not in Xy.columns or Xy["dow"].isna().any():
+        Xy["dow"] = pd.to_datetime(Xy["valid_time"]).dt.dayofweek
+
+    # --- build folds ---
+    folds = weekly_folds(Xy)
+    if not folds:
+        # time-based 80/20 fallback so we can train at least once
+        Xy = Xy.sort_values("valid_time")
+        split_idx = int(0.8 * len(Xy))
+        tr, va = Xy.iloc[:split_idx], Xy.iloc[split_idx:]
+        if len(tr) and len(va):
+            folds = [(tr, va)]
+        else:
+            logger.warning("No folds for %s H+%d", variable, horizon)
+            return None
+
+    _setup_mlflow()
+    with mlflow.start_run(run_name=f"{variable}_H{horizon}"):
+        # Baseline
+        tr = pd.concat([f[0] for f in folds], ignore_index=True)
+
+        from sklearn.impute import SimpleImputer
+
+        imp = SimpleImputer(strategy="median").set_output(transform="pandas")
+        base = Pipeline([
+            ("imp", imp),
+            ("lr", LinearRegression())
+        ]).fit(tr[feat], tr["y"])
+
+        try:
+            ens = Pipeline([
+                ("imp", imp),
+                ("lgbm", LGBMRegressor(n_estimators=300, learning_rate=0.05, max_depth=-1, subsample=0.8)),
+            ])
+            ens.fit(tr[feat], tr["y"])
+            model = ens
+            algo = "lightgbm"
+        except Exception:
+            model = base
+            algo = "linear"
+
+        dfm, rmse, mae = evaluate_model(model, folds, feat)
+        mlflow.log_params({"variable": variable, "horizon": horizon, "algo": algo})
+        mlflow.log_metric("rmse", rmse)
+        mlflow.log_metric("mae", mae)
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as tmp:
+            dfm.to_csv(tmp.name, index=False)
+            tmp_path = tmp.name
+        mlflow.log_artifact(tmp_path, artifact_path="fold_metrics")
+        os.unlink(tmp_path)
+        run_id = mlflow.active_run().info.run_id
+
+        from mlflow.models import infer_signature
+        tr = pd.concat([f[0] for f in folds], ignore_index=True)
+
+        signature = infer_signature(tr[feat], tr["y"])
+        input_example = tr[feat].head(5)
+
+        mlflow.log_params({"features": ",".join(feat)})  # optional for traceability
+        
+        model_name = f"{variable}_H{horizon}"
+        mlflow.sklearn.log_model(
+            sk_model=model,
+            artifact_path="model",
+            registered_model_name=model_name,
+            signature=signature,
+            input_example=input_example,
+            skops_trusted_types=[
+                "collections.OrderedDict",
+                "lightgbm.basic.Booster",
+                "lightgbm.sklearn.LGBMRegressor",
+                "numpy.dtype",
+            ],
+        )
+
+        # Store this model row immediately so promote can work on it
+        from src.utils.db_utils import db_conn
+        with db_conn() as conn:
+            conn.execute(
+                text("INSERT INTO models (name, mlflow_run_id, metrics_json, is_champion) VALUES (:n, :r, :m, FALSE)"),
+                {"n": model_name, "r": run_id, "m": json.dumps({
+                    "variable": variable,
+                    "horizon": horizon,
+                    "rmse": round(rmse, 4),
+                    "mae": round(mae, 4),
+                    "algo": algo,
+                })},
+            )
+        logger.info("Trained %s H+%d: RMSE=%.3f MAE=%.3f (run_id=%s)", variable, horizon, rmse, mae, run_id)
+        return {"variable": variable, "horizon": horizon, "rmse": rmse, "mae": mae, "run_id": run_id, "features": feat, "algo": algo}
+
+
+def main():
+    import json
+    results = []
+    for var in CFG.VARIABLES:
+        for h in CFG.HORIZONS_HOURS:
+            r = train_one(var, h)
+            if r:
+                results.append(r)
+
+    if not results:
+        logger.warning("No models trained — no variable/horizon combos produced valid data (skipping gracefully)")
+        return
+
+    trained = [(r["variable"], r["horizon"], r["algo"], r["rmse"], r["mae"]) for r in results]
+    logger.info("Trained %d models: %s", len(results), trained)
+
+if __name__ == "__main__":
+    main()

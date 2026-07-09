@@ -1,0 +1,25 @@
+name: Monitor 4-Hourly
+on:
+  schedule:
+    - cron: "7 */4 * * *"   # every 4 hours at :07
+  workflow_dispatch: {}
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run monitor + leaderboard
+        run: python -m src.jobs.job_monitor_hourly
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
